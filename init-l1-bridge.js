@@ -13,7 +13,7 @@ const {
 const fs = require('fs');
 
 // ── Config ──────────────────────────────────────────────────────────────────
-const L1_RPC = 'https://mainnet.helius-rpc.com/?api-key=5ef91a09-b6c1-4993-ae22-a203db16ae0f';
+const L1_RPC = process.env.L1_RPC_URL || 'https://api.mainnet-beta.solana.com';
 const BRIDGE_L1_PROGRAM_ID = new PublicKey('oEQfREm4FQkaVeRoxJHkJLB1feHprrntY6eJuW2zbqQ');
 const MYTH_L1_MINT = new PublicKey('5UP2iL9DefXC3yovX9b4XG2EiCnyxuVo3S2F6ik5pump');
 
