@@ -163,7 +163,7 @@ export class L1Client {
       { pubkey: this.relayer.publicKey, isSigner: true, isWritable: false }, // sequencer
       { pubkey: this.relayer.publicKey, isSigner: true, isWritable: true },  // payer
       { pubkey: withdrawalPda, isSigner: false, isWritable: true },          // withdrawal PDA
-      { pubkey: configPda, isSigner: false, isWritable: false },             // bridge config
+      { pubkey: configPda, isSigner: false, isWritable: true },              // bridge config (writable for program check)
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // system_program
     ];
 
@@ -206,6 +206,7 @@ export class L1Client {
       { pubkey: params.recipientTokenAccount, isSigner: false, isWritable: true }, // recipient ATA
       { pubkey: params.tokenMint, isSigner: false, isWritable: false },      // token mint
       { pubkey: configPda, isSigner: false, isWritable: false },             // bridge config
+      { pubkey: new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"), isSigner: false, isWritable: false }, // token-2022 program
     ];
 
     const ix = new TransactionInstruction({
@@ -217,7 +218,94 @@ export class L1Client {
     return this.sendTransaction([ix]);
   }
 
-  // Internal: build, sign and send a transaction with retry
+
+
+  /**
+   * Find the next available L1 withdrawal nonce.
+   * Starts from the given nonce and increments until an unused PDA is found.
+   */
+  async findAvailableL1Nonce(startNonce: bigint): Promise<bigint> {
+    let nonce = startNonce;
+    for (let i = 0; i < 100; i++) {
+      const pda = this.withdrawalPda(nonce);
+      const info = await this.connection.getAccountInfo(pda);
+      if (info === null) {
+        return nonce;
+      }
+      logger.debug({ nonce: nonce.toString() }, "L1 nonce already used, trying next");
+      nonce++;
+    }
+    throw new Error("Could not find available L1 nonce after 100 attempts");
+  }
+
+    // Token-2022 program and ATA program
+  static readonly TOKEN_2022_PROGRAM = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+  static readonly ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bbd");
+
+  /**
+   * Derive the Token-2022 Associated Token Account for a wallet + mint.
+   */
+  static getToken2022ATA(owner: PublicKey, mint: PublicKey): PublicKey {
+    const [ata] = PublicKey.findProgramAddressSync(
+      [owner.toBuffer(), L1Client.TOKEN_2022_PROGRAM.toBuffer(), mint.toBuffer()],
+      L1Client.ATA_PROGRAM
+    );
+    return ata;
+  }
+
+  /**
+   * Find or create a token account for the recipient.
+   * First checks for any existing token accounts (wallet-created ATAs may use
+   * non-standard derivation). Falls back to creating a Token-2022 ATA.
+   */
+  async ensureRecipientATA(
+    recipient: PublicKey,
+    tokenMint: PublicKey
+  ): Promise<PublicKey> {
+    // First: check for ANY existing token accounts for this mint owned by recipient
+    try {
+      const accounts = await this.connection.getTokenAccountsByOwner(recipient, {
+        mint: tokenMint,
+      });
+      if (accounts.value.length > 0) {
+        const existing = accounts.value[0].pubkey;
+        logger.info(
+          { recipient: recipient.toBase58(), ata: existing.toBase58() },
+          "L1: Found existing token account for recipient"
+        );
+        return existing;
+      }
+    } catch (err) {
+      logger.warn({ err }, "L1: Failed to query token accounts, will try ATA creation");
+    }
+
+    // No existing account found — create Token-2022 ATA
+    const ata = L1Client.getToken2022ATA(recipient, tokenMint);
+    logger.info(
+      { recipient: recipient.toBase58(), mint: tokenMint.toBase58(), ata: ata.toBase58() },
+      "L1: Creating Token-2022 ATA for recipient"
+    );
+
+    const keys = [
+      { pubkey: this.relayer.publicKey, isSigner: true, isWritable: true },
+      { pubkey: ata, isSigner: false, isWritable: true },
+      { pubkey: recipient, isSigner: false, isWritable: false },
+      { pubkey: tokenMint, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: L1Client.TOKEN_2022_PROGRAM, isSigner: false, isWritable: false },
+    ];
+
+    const ix = new TransactionInstruction({
+      programId: L1Client.ATA_PROGRAM,
+      keys,
+      data: Buffer.from([1]), // CreateIdempotent
+    });
+
+    await this.sendTransaction([ix]);
+    return ata;
+  }
+
+    // Internal: build, sign and send a transaction with retry
   async sendTransaction(
     instructions: TransactionInstruction[],
     maxRetries: number = 3
@@ -246,6 +334,7 @@ export class L1Client {
           {
             commitment: "confirmed",
             maxRetries: 2,
+            skipPreflight: true,
           }
         );
         return sig;
@@ -263,7 +352,42 @@ export class L1Client {
     throw lastError;
   }
 
-  // Extract log messages from a parsed transaction
+// ── IX 12: SequencerWithdrawSOL ─────────────────────────────────────────────
+  // Allows the sequencer (relayer) to withdraw SOL from the bridge vault PDA
+  // so it can fund PumpSwap swaps using the deposited SOL itself.
+
+  async withdrawSolFromVault(amount: bigint): Promise<string> {
+    const configPda = this.bridgeConfigPda();
+    const solVault = this.solVaultPda();
+
+    // Instruction data: [12 (u8)] + [amount (u64 LE)] = 9 bytes
+    const data = Buffer.alloc(9);
+    data.writeUInt8(12, 0); // IX_SEQUENCER_WITHDRAW_SOL
+    data.writeBigUInt64LE(amount, 1);
+
+    const accounts: AccountMeta[] = [
+      { pubkey: this.relayer.publicKey, isSigner: true, isWritable: true },   // sequencer
+      { pubkey: solVault, isSigner: false, isWritable: true },                // sol_vault PDA
+      { pubkey: configPda, isSigner: false, isWritable: false },              // bridge_config
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // system_program
+    ];
+
+    const ix = new TransactionInstruction({
+      programId: this.bridgeProgram,
+      keys: accounts,
+      data,
+    });
+
+    logger.info({
+      amount: amount.toString(),
+      solReadable: (Number(amount) / 1e9).toFixed(4),
+      vault: solVault.toBase58(),
+    }, "L1: Withdrawing SOL from bridge vault for PumpSwap");
+
+    return this.sendTransaction([ix]);
+  }
+
+    // Extract log messages from a parsed transaction
   static extractLogs(tx: ParsedTransactionWithMeta): string[] {
     return tx.meta?.logMessages ?? [];
   }

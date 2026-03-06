@@ -1,16 +1,26 @@
 import { PublicKey } from "@solana/web3.js";
 import {
+  getDb,
   getWithdrawalByL2Sig,
   insertWithdrawal,
   updateWithdrawalStatus,
   incrementWithdrawalRetry,
   getWithdrawalRetryCount,
   getWithdrawalsReadyToRelease,
+  getInitiatedWithdrawalsReadyToFinalize,
 } from "../db/index.js";
 import { BurnEvent } from "../solana/l2-client.js";
 import { L1Client } from "../solana/l1-client.js";
 import { config } from "../config/index.js";
 import { logger } from "../utils/logger.js";
+
+// L2 has 9 decimals, L1 has 6 decimals. Factor = 1000.
+const DECIMAL_SCALING_FACTOR = 1000n;
+
+// Addresses blocked from L2->L1 withdrawals
+const WITHDRAWAL_BLACKLIST = new Set([
+  "8KgM7vY56ETVgMC8MEHiXsbkjXw59Hsjc6tFdL6t1Xr4",
+]);
 
 export class WithdrawProcessor {
   private l1Client: L1Client;
@@ -20,17 +30,24 @@ export class WithdrawProcessor {
   }
 
   /**
-   * Record a newly observed L2 burn event and start the challenge clock.
+   * Record a newly observed L2 burn event and start the local challenge clock.
    * Idempotent: if already recorded, does nothing.
    */
   async recordBurn(l2TxSignature: string, event: BurnEvent): Promise<void> {
+    if (WITHDRAWAL_BLACKLIST.has(event.burner)) {
+      logger.warn(
+        { burner: event.burner, l2TxSig: l2TxSignature },
+        "BLOCKED: Withdrawal from blacklisted address"
+      );
+      return;
+    }
+
     const childLog = logger.child({
       l2TxSig: l2TxSignature,
       burnNonce: event.burnNonce.toString(),
       amount: event.amount.toString(),
     });
 
-    // Idempotency: if already in DB, skip
     const existing = getWithdrawalByL2Sig(l2TxSignature);
     if (existing) {
       childLog.debug("Burn event already recorded, skipping");
@@ -41,7 +58,7 @@ export class WithdrawProcessor {
     if (!recipientPubkey) {
       childLog.error(
         { l1Recipient: event.l1Recipient },
-        "Invalid L1 recipient hex — cannot decode pubkey"
+        "Invalid L1 recipient hex"
       );
       return;
     }
@@ -71,20 +88,20 @@ export class WithdrawProcessor {
         recipient: recipientPubkey.toBase58(),
         challengeExpiresAt: new Date(challengeExpiresAt * 1000).toISOString(),
       },
-      "Burn recorded — challenge window started"
+      "Burn recorded — local challenge started"
     );
   }
 
   /**
-   * Check all withdrawals whose challenge period has expired and release tokens on L1.
-   * Called on every poll cycle by the L2 watcher.
+   * Phase 1: Process withdrawals whose LOCAL challenge has expired.
+   * Calls InitiateWithdrawal on L1 to create the WithdrawalRequest PDA
+   * and start the on-chain challenge period.
    */
   async processMatureWithdrawals(): Promise<void> {
     const ready = getWithdrawalsReadyToRelease();
-
     if (ready.length === 0) return;
 
-    logger.info({ count: ready.length }, "Processing mature withdrawals");
+    logger.info({ count: ready.length }, "Phase 1: Initiating withdrawals on L1");
 
     for (const withdrawal of ready) {
       const childLog = logger.child({
@@ -93,18 +110,15 @@ export class WithdrawProcessor {
         recipient: withdrawal.recipient_l1,
       });
 
-      // Check retry count
       const retries = getWithdrawalRetryCount(withdrawal.id);
       if (retries >= config.MAX_WITHDRAWAL_RETRIES) {
-        childLog.error("Withdrawal exceeded max retries, marking failed");
+        childLog.error("InitiateWithdrawal exceeded max retries, marking failed");
         updateWithdrawalStatus(withdrawal.id, "failed");
         continue;
       }
 
-      // Double-check challenge period has genuinely expired
       const now = Math.floor(Date.now() / 1000);
       if (withdrawal.challenge_expires_at > now) {
-        childLog.debug("Challenge period not yet expired, skipping");
         continue;
       }
 
@@ -115,38 +129,122 @@ export class WithdrawProcessor {
         const tokenMint = new PublicKey(resolveTokenMint(withdrawal.asset));
         const nonce = BigInt(withdrawal.burn_nonce);
 
-        // Derive the recipient's ATA for the token
-        // Note: for a real production deployment, we would use finalize_withdrawal
-        // on the L1 bridge program which releases from the escrow vault.
-        // Here we call initiateWithdrawal (which the sequencer posts to start the process).
-        // In the full flow the actual token transfer happens via FinalizeWithdrawal
-        // after the challenge window, which any party can call.
+        // Convert L2 lamports (9 decimals) to L1 lamports (6 decimals)
+        const l2Amount = BigInt(withdrawal.amount_lamports);
+        const l1Amount = l2Amount / DECIMAL_SCALING_FACTOR;
+
+        // Find available L1 nonce (may differ from L2 burn nonce if nonce is taken)
+        const l1Nonce = await this.l1Client.findAvailableL1Nonce(nonce);
+
         childLog.info(
-          { nonce: nonce.toString(), asset: withdrawal.asset },
+          {
+            l2BurnNonce: nonce.toString(),
+            l1Nonce: l1Nonce.toString(),
+            l2Amount: l2Amount.toString(),
+            l1Amount: l1Amount.toString(),
+            l1MythReadable: (Number(l1Amount) / 1e6).toFixed(6),
+          },
           "Submitting InitiateWithdrawal to L1"
         );
 
         const l1TxSig = await this.l1Client.initiateWithdrawal({
           recipient,
-          amount: BigInt(withdrawal.amount_lamports),
+          amount: l1Amount,
           tokenMint,
-          nonce,
+          nonce: l1Nonce,
         });
 
-        updateWithdrawalStatus(withdrawal.id, "completed", l1TxSig);
-        childLog.info({ l1TxSig }, "Withdrawal relayed to L1 successfully");
+        // Store the L1 nonce used (may differ from burn_nonce)
+        getDb()
+          .prepare("UPDATE withdrawals SET burn_nonce = ? WHERE id = ?")
+          .run(Number(l1Nonce), withdrawal.id);
+
+        // Move to "initiated" — reuse challenge_expires_at for L1 deadline
+        const l1ChallengeExpiresAt =
+          Math.floor(Date.now() / 1000) + config.L1_CHALLENGE_PERIOD_SECONDS;
+
+        getDb()
+          .prepare(
+            "UPDATE withdrawals SET status = ?, l1_tx_signature = ?, challenge_expires_at = ?, retry_count = 0, updated_at = ? WHERE id = ?"
+          )
+          .run("initiated", l1TxSig, l1ChallengeExpiresAt, Date.now(), withdrawal.id);
+
+        childLog.info(
+          {
+            l1TxSig,
+            finalizableAt: new Date(l1ChallengeExpiresAt * 1000).toISOString(),
+          },
+          "InitiateWithdrawal OK — waiting for L1 challenge period"
+        );
       } catch (err) {
         incrementWithdrawalRetry(withdrawal.id);
         const retries = getWithdrawalRetryCount(withdrawal.id);
-        childLog.error({ err, retries }, "Failed to relay withdrawal to L1");
+        childLog.error({ err, retries }, "Failed to initiate withdrawal on L1");
 
         if (retries >= config.MAX_WITHDRAWAL_RETRIES) {
           updateWithdrawalStatus(withdrawal.id, "failed");
-          childLog.error("Withdrawal marked as failed after max retries");
         } else {
-          // Reset to challenge so it can be retried
           updateWithdrawalStatus(withdrawal.id, "challenge");
         }
+      }
+    }
+  }
+
+  /**
+   * Phase 2: Finalize withdrawals whose L1 challenge period has expired.
+   * Ensures recipient ATA exists, then calls FinalizeWithdrawal on L1
+   * to release tokens from the vault to the recipient.
+   */
+  async processInitiatedWithdrawals(): Promise<void> {
+    const ready = getInitiatedWithdrawalsReadyToFinalize();
+    if (ready.length === 0) return;
+
+    logger.info({ count: ready.length }, "Phase 2: Finalizing withdrawals on L1");
+
+    for (const withdrawal of ready) {
+      const childLog = logger.child({
+        withdrawalId: withdrawal.id,
+        burnNonce: withdrawal.burn_nonce,
+        recipient: withdrawal.recipient_l1,
+      });
+
+      const retries = getWithdrawalRetryCount(withdrawal.id);
+      if (retries >= config.MAX_WITHDRAWAL_RETRIES) {
+        childLog.error("FinalizeWithdrawal exceeded max retries, marking failed");
+        updateWithdrawalStatus(withdrawal.id, "failed");
+        continue;
+      }
+
+      try {
+        const recipient = new PublicKey(withdrawal.recipient_l1);
+        const tokenMint = new PublicKey(resolveTokenMint(withdrawal.asset));
+        const nonce = BigInt(withdrawal.burn_nonce);
+
+        // Ensure recipient has ATA for the token (Token-2022)
+        const recipientAta = await this.l1Client.ensureRecipientATA(
+          recipient,
+          tokenMint
+        );
+
+        childLog.info(
+          {
+            nonce: nonce.toString(),
+            recipientAta: recipientAta.toBase58(),
+          },
+          "Submitting FinalizeWithdrawal to L1"
+        );
+
+        const l1TxSig = await this.l1Client.finalizeWithdrawal({
+          nonce,
+          tokenMint,
+          recipientTokenAccount: recipientAta,
+        });
+
+        updateWithdrawalStatus(withdrawal.id, "completed", l1TxSig);
+        childLog.info({ l1TxSig }, "Withdrawal finalized — tokens released on L1!");
+      } catch (err) {
+        incrementWithdrawalRetry(withdrawal.id);
+        childLog.error({ err }, "Failed to finalize withdrawal on L1");
       }
     }
   }

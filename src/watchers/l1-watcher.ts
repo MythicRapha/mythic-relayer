@@ -15,7 +15,7 @@ export class L1Watcher {
 
   constructor(l1Client: L1Client, l2Client: L2Client) {
     this.l1Client = l1Client;
-    this.depositProcessor = new DepositProcessor(l2Client);
+    this.depositProcessor = new DepositProcessor(l2Client, l1Client);
   }
 
   async start(): Promise<void> {
@@ -54,7 +54,6 @@ export class L1Watcher {
   }
 
   private async pollOnce(): Promise<void> {
-    // Load the last processed signature so we only fetch new ones
     const lastSig = getRelayerState(STATE_KEY_LAST_SIG) ?? undefined;
 
     logger.debug(
@@ -62,9 +61,6 @@ export class L1Watcher {
       "L1Watcher: Fetching signatures"
     );
 
-    // getSignaturesForAddress returns newest-first; "before" param means
-    // "return signatures older than this one", so we use "until" semantics by
-    // fetching without "before" and stopping when we hit the lastSig.
     const signatures = await this.l1Client.getRecentSignatures(
       undefined,
       config.SIGNATURES_FETCH_LIMIT
@@ -75,12 +71,10 @@ export class L1Watcher {
       return;
     }
 
-    // Signatures are newest-first. We process oldest-first to maintain ordering.
-    // Collect only new signatures (those we haven't seen yet).
     const newSigs: typeof signatures = [];
     for (const sigInfo of signatures) {
       if (sigInfo.signature === lastSig) break;
-      if (sigInfo.err !== null) continue; // skip failed txs
+      if (sigInfo.err !== null) continue;
       newSigs.push(sigInfo);
     }
 
@@ -91,9 +85,7 @@ export class L1Watcher {
 
     logger.info({ count: newSigs.length }, "L1Watcher: Processing new signatures");
 
-    // Process oldest-first (reverse the newest-first list)
     const ordered = [...newSigs].reverse();
-
     let newestProcessed: string | null = null;
 
     for (const sigInfo of ordered) {
@@ -109,7 +101,6 @@ export class L1Watcher {
       const depositEvent = L1Client.parseDepositEvent(logs);
 
       if (!depositEvent) {
-        // Not a deposit transaction — mark as seen but skip processing
         newestProcessed = sig;
         continue;
       }
@@ -131,15 +122,11 @@ export class L1Watcher {
         newestProcessed = sig;
       } catch (err) {
         logger.error({ err, sig }, "L1Watcher: Failed to process deposit");
-        // Still advance the cursor so we don't get stuck
         newestProcessed = sig;
       }
     }
 
-    // Persist the newest signature we've seen so next poll starts here
     if (newestProcessed) {
-      // The newest in the newest-first list is signatures[0]
-      // We want to store signatures[0] so next poll stops there
       setRelayerState(STATE_KEY_LAST_SIG, signatures[0].signature);
     }
   }

@@ -51,6 +51,10 @@ export const config = {
     optionalEnv("CHALLENGE_PERIOD_SECONDS", "604800"),
     10
   ),
+  L1_CHALLENGE_PERIOD_SECONDS: parseInt(
+    optionalEnv("L1_CHALLENGE_PERIOD_SECONDS", "86400"),
+    10
+  ),
 
   // Logging
   LOG_LEVEL: optionalEnv("LOG_LEVEL", "info"),

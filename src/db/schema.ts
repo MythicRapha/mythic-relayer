@@ -53,6 +53,7 @@ export type DepositStatus =
 export type WithdrawalStatus =
   | "pending"
   | "challenge"
+  | "initiated"
   | "releasing"
   | "completed"
   | "failed";

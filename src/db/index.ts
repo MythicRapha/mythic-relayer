@@ -154,6 +154,19 @@ export function getWithdrawalsReadyToRelease(): WithdrawalRow[] {
     .all(now) as WithdrawalRow[];
 }
 
+
+export function getInitiatedWithdrawalsReadyToFinalize(): WithdrawalRow[] {
+  const now = Math.floor(Date.now() / 1000);
+  return getDb()
+    .prepare(
+      `SELECT * FROM withdrawals
+       WHERE status = 'initiated'
+         AND challenge_expires_at <= ?
+       ORDER BY challenge_expires_at ASC`
+    )
+    .all(now) as WithdrawalRow[];
+}
+
 export function getPendingWithdrawals(): WithdrawalRow[] {
   return getDb()
     .prepare(

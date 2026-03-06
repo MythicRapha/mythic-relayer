@@ -1,0 +1,389 @@
+// PumpSwap server-side integration — swaps SOL → MYTH via PumpFun AMM
+// Used by the relayer to convert deposited SOL into MYTH on L1 mainnet
+
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  Transaction,
+  TransactionInstruction,
+  SystemProgram,
+  ComputeBudgetProgram,
+} from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  NATIVE_MINT,
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction,
+  createSyncNativeInstruction,
+  createCloseAccountInstruction,
+  createTransferInstruction,
+} from "@solana/spl-token";
+import { logger } from "../utils/logger.js";
+
+// ── PumpSwap Constants ──────────────────────────────────────────────────────
+
+const PUMPSWAP_PROGRAM_ID = new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+const PUMPFEE_PROGRAM_ID = new PublicKey("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+const ATA_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
+// MYTH/SOL pool on PumpSwap
+const MYTH_POOL = new PublicKey("Hg6fPz8zPQtrV7McXh7SxQndmd6zh4v8HSvQ6yYg3uuB");
+export const MYTH_MINT = new PublicKey("5UP2iL9DefXC3yovX9b4XG2EiCnyxuVo3S2F6ik5pump");
+
+// Pool token accounts (from on-chain pool data)
+const POOL_BASE_TOKEN_ACCOUNT = new PublicKey("iB28uxnFM6dA2fixVpX9KEthsRWeS2FWwmTXVxqnVyk");   // MYTH
+const POOL_QUOTE_TOKEN_ACCOUNT = new PublicKey("3dgiBGb3qgsJb3GrkN1ikQTLtZS67dUEmSN1fCE63DAe"); // wSOL
+
+// sha256("global:buy")[0..8]
+const BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+
+const POOL_COIN_CREATOR_OFFSET = 211;
+const GLOBAL_CONFIG_RECIPIENTS_OFFSET = 57;
+
+// Standard Helius RPC for sending transactions (NOT beta)
+const HELIUS_SEND_RPC = "https://mainnet.helius-rpc.com/?api-key=60aa17ec-d160-4cd9-8a51-e74f693bc403";
+
+// ── AMM Math (constant product) ─────────────────────────────────────────────
+
+function calculateBuyOutput(
+  solAmountLamports: bigint,
+  solReserve: bigint,
+  mythReserve: bigint,
+): bigint {
+  const k = solReserve * mythReserve;
+  const newSolReserve = solReserve + solAmountLamports;
+  const newMythReserve = k / newSolReserve + BigInt(1); // round up
+  const mythOut = mythReserve - newMythReserve;
+  return mythOut > BigInt(0) ? mythOut : BigInt(0);
+}
+
+function applySlippage(amount: bigint, slippageBps: number): bigint {
+  return amount * BigInt(10000 - slippageBps) / BigInt(10000);
+}
+
+function writeBigUInt64LE(buf: Buffer, value: bigint, offset: number) {
+  const lo = Number(value & BigInt(0xFFFFFFFF));
+  const hi = Number((value >> BigInt(32)) & BigInt(0xFFFFFFFF));
+  buf.writeUInt32LE(lo, offset);
+  buf.writeUInt32LE(hi, offset + 4);
+}
+
+// ── Send + Confirm (reliable) ───────────────────────────────────────────────
+
+async function sendAndConfirmRaw(
+  rawTx: Buffer,
+  primaryConn: Connection,
+): Promise<string> {
+  // Use dedicated Helius standard RPC for sending (not beta)
+  const sendConn = new Connection(HELIUS_SEND_RPC, "confirmed");
+
+  // Send to Helius standard RPC
+  const txSignature = await sendConn.sendRawTransaction(rawTx, {
+    skipPreflight: true,
+    maxRetries: 5,
+  });
+
+  // Also fire-and-forget to public RPC for redundancy
+  try {
+    const pubConn = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+    await pubConn.sendRawTransaction(rawTx, { skipPreflight: true });
+    logger.info("PumpSwap: tx also broadcast to public RPC");
+  } catch { /* ignore */ }
+
+  logger.info({ txSignature }, "PumpSwap: tx broadcast, polling for confirmation");
+
+  // Poll for confirmation
+  const TIMEOUT_MS = 90_000;
+  const POLL_MS = 2_000;
+  const start = Date.now();
+
+  while (Date.now() - start < TIMEOUT_MS) {
+    await new Promise(r => setTimeout(r, POLL_MS));
+
+    try {
+      const status = await sendConn.getSignatureStatus(txSignature);
+      if (status?.value) {
+        if (status.value.err) {
+          const errStr = JSON.stringify(status.value.err);
+          logger.error({ txSignature, err: errStr }, "PumpSwap: tx failed on-chain");
+          throw new Error("PumpSwap tx failed on-chain: " + errStr);
+        }
+        const cs = status.value.confirmationStatus;
+        if (cs === "confirmed" || cs === "finalized") {
+          logger.info({ txSignature, status: cs }, "PumpSwap: tx confirmed");
+          return txSignature;
+        }
+      }
+    } catch (e: any) {
+      if (e.message?.startsWith("PumpSwap tx failed")) throw e;
+      // RPC error during polling — keep trying
+      logger.warn({ err: e.message }, "PumpSwap: polling error, retrying");
+    }
+
+    // Re-send every 10s in case the tx wasn't picked up
+    if ((Date.now() - start) % 10_000 < POLL_MS) {
+      try {
+        await sendConn.sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 0 });
+      } catch { /* ignore */ }
+    }
+  }
+
+  throw new Error("PumpSwap tx not confirmed within " + (TIMEOUT_MS / 1000) + "s — signature: " + txSignature);
+}
+
+// ── Swap SOL → MYTH ─────────────────────────────────────────────────────────
+
+export interface SwapResult {
+  txSignature: string;
+  mythReceived: bigint;   // raw MYTH units (6 decimals on L1)
+  solSpent: bigint;       // lamports
+}
+
+export async function swapSolForMyth(
+  connection: Connection,
+  relayer: Keypair,
+  solAmountLamports: bigint,
+  slippageBps: number = 500,
+): Promise<SwapResult> {
+  const user = relayer.publicKey;
+
+  // Derive PDAs
+  const [globalConfig] = PublicKey.findProgramAddressSync(
+    [Buffer.from("global_config")], PUMPSWAP_PROGRAM_ID,
+  );
+  const [eventAuthority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("__event_authority")], PUMPSWAP_PROGRAM_ID,
+  );
+  const [globalVolumeAccumulator] = PublicKey.findProgramAddressSync(
+    [Buffer.from("global_volume_accumulator")], PUMPSWAP_PROGRAM_ID,
+  );
+  const [userVolumeAccumulator] = PublicKey.findProgramAddressSync(
+    [Buffer.from("user_volume_accumulator"), user.toBytes()], PUMPSWAP_PROGRAM_ID,
+  );
+  const [feeConfig] = PublicKey.findProgramAddressSync(
+    [Buffer.from("fee_config"), PUMPSWAP_PROGRAM_ID.toBytes()], PUMPFEE_PROGRAM_ID,
+  );
+
+  // Fetch pool data + reserves
+  const [poolInfo, globalConfigInfo, solBal, mythBal] = await Promise.all([
+    connection.getAccountInfo(MYTH_POOL),
+    connection.getAccountInfo(globalConfig),
+    connection.getTokenAccountBalance(POOL_QUOTE_TOKEN_ACCOUNT),
+    connection.getTokenAccountBalance(POOL_BASE_TOKEN_ACCOUNT),
+  ]);
+
+  if (!poolInfo?.data) throw new Error("Failed to fetch MYTH pool account");
+  if (!globalConfigInfo?.data) throw new Error("Failed to fetch PumpSwap global config");
+
+  // Extract coin_creator and derive vault authority
+  const poolCoinCreator = new PublicKey(
+    poolInfo.data.subarray(POOL_COIN_CREATOR_OFFSET, POOL_COIN_CREATOR_OFFSET + 32)
+  );
+  const [coinCreatorVaultAuthority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("creator_vault"), poolCoinCreator.toBytes()], PUMPSWAP_PROGRAM_ID,
+  );
+
+  // Extract protocol fee recipient
+  const protocolFeeRecipient = new PublicKey(
+    globalConfigInfo.data.subarray(
+      GLOBAL_CONFIG_RECIPIENTS_OFFSET,
+      GLOBAL_CONFIG_RECIPIENTS_OFFSET + 32,
+    )
+  );
+
+  // Calculate AMM output
+  const solReserve = BigInt(solBal.value.amount);
+  const mythReserve = BigInt(mythBal.value.amount);
+  const expectedMythOut = calculateBuyOutput(solAmountLamports, solReserve, mythReserve);
+  const minMythOut = applySlippage(expectedMythOut, slippageBps);
+
+  if (expectedMythOut <= BigInt(0)) {
+    throw new Error("Insufficient pool liquidity for this swap amount");
+  }
+
+  logger.info({
+    solIn: solAmountLamports.toString(),
+    expectedMyth: expectedMythOut.toString(),
+    minMyth: minMythOut.toString(),
+    poolSol: solReserve.toString(),
+    poolMyth: mythReserve.toString(),
+  }, "PumpSwap: calculated swap output");
+
+  // Token programs
+  const mythTokenProgram = TOKEN_2022_PROGRAM_ID;
+  const wsolTokenProgram = TOKEN_PROGRAM_ID;
+
+  // ATAs
+  const userMythAta = getAssociatedTokenAddressSync(MYTH_MINT, user, false, mythTokenProgram);
+  const userWsolAta = getAssociatedTokenAddressSync(NATIVE_MINT, user, false, wsolTokenProgram);
+  const protocolFeeAta = getAssociatedTokenAddressSync(
+    NATIVE_MINT, protocolFeeRecipient, true, wsolTokenProgram,
+  );
+  const coinCreatorVaultAta = getAssociatedTokenAddressSync(
+    NATIVE_MINT, coinCreatorVaultAuthority, true, wsolTokenProgram,
+  );
+
+  // Build instruction data: disc(8) + baseAmountOut(u64) + maxQuoteAmountIn(u64) + trackVolume(1)
+  const data = Buffer.alloc(25);
+  BUY_DISCRIMINATOR.copy(data, 0);
+  writeBigUInt64LE(data, minMythOut, 8);
+  const maxSolIn = solAmountLamports + (solAmountLamports * BigInt(slippageBps) / BigInt(10000));
+  writeBigUInt64LE(data, maxSolIn, 16);
+  data[24] = 0; // trackVolume = None
+
+  // 23-account buy instruction
+  const buyIx = new TransactionInstruction({
+    programId: PUMPSWAP_PROGRAM_ID,
+    keys: [
+      { pubkey: MYTH_POOL, isSigner: false, isWritable: true },
+      { pubkey: user, isSigner: true, isWritable: true },
+      { pubkey: globalConfig, isSigner: false, isWritable: false },
+      { pubkey: MYTH_MINT, isSigner: false, isWritable: false },
+      { pubkey: NATIVE_MINT, isSigner: false, isWritable: false },
+      { pubkey: userMythAta, isSigner: false, isWritable: true },
+      { pubkey: userWsolAta, isSigner: false, isWritable: true },
+      { pubkey: POOL_BASE_TOKEN_ACCOUNT, isSigner: false, isWritable: true },
+      { pubkey: POOL_QUOTE_TOKEN_ACCOUNT, isSigner: false, isWritable: true },
+      { pubkey: protocolFeeRecipient, isSigner: false, isWritable: false },
+      { pubkey: protocolFeeAta, isSigner: false, isWritable: true },
+      { pubkey: mythTokenProgram, isSigner: false, isWritable: false },
+      { pubkey: wsolTokenProgram, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: ATA_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: eventAuthority, isSigner: false, isWritable: false },
+      { pubkey: PUMPSWAP_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: coinCreatorVaultAta, isSigner: false, isWritable: true },
+      { pubkey: coinCreatorVaultAuthority, isSigner: false, isWritable: false },
+      { pubkey: globalVolumeAccumulator, isSigner: false, isWritable: false },
+      { pubkey: userVolumeAccumulator, isSigner: false, isWritable: true },
+      { pubkey: feeConfig, isSigner: false, isWritable: false },
+      { pubkey: PUMPFEE_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+
+  // Pre-swap MYTH balance
+  let preBalance = BigInt(0);
+  try {
+    const bal = await connection.getTokenAccountBalance(userMythAta);
+    preBalance = BigInt(bal.value.amount);
+  } catch {
+    // ATA doesn't exist yet
+  }
+
+  // Build full tx
+  const tx = new Transaction();
+  tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }));
+  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }));
+
+  // Create ATAs (idempotent)
+  tx.add(createAssociatedTokenAccountIdempotentInstruction(
+    user, userMythAta, user, MYTH_MINT, mythTokenProgram,
+  ));
+  tx.add(createAssociatedTokenAccountIdempotentInstruction(
+    user, userWsolAta, user, NATIVE_MINT, wsolTokenProgram,
+  ));
+
+  // Wrap SOL
+  tx.add(SystemProgram.transfer({
+    fromPubkey: user, toPubkey: userWsolAta, lamports: Number(maxSolIn),
+  }));
+  tx.add(createSyncNativeInstruction(userWsolAta, wsolTokenProgram));
+
+  // Swap
+  tx.add(buyIx);
+
+  // Unwrap remaining wSOL
+  tx.add(createCloseAccountInstruction(userWsolAta, user, user, [], wsolTokenProgram));
+
+  // Sign and serialize
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash;
+  tx.lastValidBlockHeight = lastValidBlockHeight;
+  tx.feePayer = user;
+  tx.sign(relayer);
+  const rawTx = tx.serialize();
+
+  // Send via reliable multi-RPC method
+  const txSignature = await sendAndConfirmRaw(rawTx, connection);
+
+  // Post-swap MYTH balance
+  const postBal = await connection.getTokenAccountBalance(userMythAta);
+  const postBalance = BigInt(postBal.value.amount);
+  const mythReceived = postBalance - preBalance;
+
+  logger.info({
+    txSignature,
+    mythReceived: mythReceived.toString(),
+    mythReadable: (Number(mythReceived) / 1e6).toFixed(2),
+    expected: expectedMythOut.toString(),
+  }, "PumpSwap: swap completed");
+
+  return { txSignature, mythReceived, solSpent: solAmountLamports };
+}
+
+/**
+ * Transfer MYTH from relayer's ATA to the bridge MYTH vault (Token-2022).
+ * Non-critical — if this fails, the L2 credit still happens.
+ */
+export async function transferMythToVault(
+  connection: Connection,
+  relayer: Keypair,
+  bridgeVault: PublicKey,
+  amount: bigint,
+): Promise<string> {
+  const user = relayer.publicKey;
+  const userMythAta = getAssociatedTokenAddressSync(
+    MYTH_MINT, user, false, TOKEN_2022_PROGRAM_ID,
+  );
+
+  const tx = new Transaction();
+  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000 }));
+  tx.add(createTransferInstruction(
+    userMythAta, bridgeVault, user, amount, [], TOKEN_2022_PROGRAM_ID,
+  ));
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash;
+  tx.lastValidBlockHeight = lastValidBlockHeight;
+  tx.feePayer = user;
+  tx.sign(relayer);
+
+  const sig = await sendAndConfirmRaw(tx.serialize(), connection);
+
+  logger.info({
+    sig,
+    amount: amount.toString(),
+    vault: bridgeVault.toBase58(),
+  }, "PumpSwap: transferred MYTH to bridge vault");
+
+  return sig;
+}
+
+// ── Exported helpers for rate-based credit ──────────────────────────────────
+
+export interface PoolReserves {
+  solReserve: bigint;
+  mythReserve: bigint;
+}
+
+export async function getPoolReserves(connection: Connection): Promise<PoolReserves> {
+  const [solBal, mythBal] = await Promise.all([
+    connection.getTokenAccountBalance(POOL_QUOTE_TOKEN_ACCOUNT),
+    connection.getTokenAccountBalance(POOL_BASE_TOKEN_ACCOUNT),
+  ]);
+  return {
+    solReserve: BigInt(solBal.value.amount),
+    mythReserve: BigInt(mythBal.value.amount),
+  };
+}
+
+export function calculateBuyOutputExported(
+  solAmountLamports: bigint,
+  solReserve: bigint,
+  mythReserve: bigint,
+): bigint {
+  return calculateBuyOutput(solAmountLamports, solReserve, mythReserve);
+}

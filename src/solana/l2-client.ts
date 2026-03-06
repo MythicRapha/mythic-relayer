@@ -19,10 +19,11 @@ import { logger } from "../utils/logger.js";
 const L2_BRIDGE_CONFIG_SEED = Buffer.from("l2_bridge_config");
 const WRAPPED_MINT_SEED = Buffer.from("wrapped_mint");
 const PROCESSED_SEED = Buffer.from("processed");
+const BRIDGE_RESERVE_SEED = Buffer.from("bridge_reserve");
 const MINT_SEED = Buffer.from("mint");
 
 // Instruction discriminators
-const IX_MINT_WRAPPED = 2;
+const IX_RELEASE_BRIDGED = 2;
 
 export class L2Client {
   readonly connection: Connection;
@@ -85,6 +86,15 @@ export class L2Client {
     return pda;
   }
 
+  // Derive the bridge reserve PDA (holds native MYTH for bridged releases)
+  bridgeReservePda(): PublicKey {
+    const [pda] = PublicKey.findProgramAddressSync(
+      [BRIDGE_RESERVE_SEED],
+      this.bridgeProgram
+    );
+    return pda;
+  }
+
   // Derive wrapped_token_info PDA for a given L1 mint
   wrappedTokenInfoPda(l1Mint: PublicKey): PublicKey {
     const [pda] = PublicKey.findProgramAddressSync(
@@ -137,19 +147,17 @@ export class L2Client {
   }
 
   /**
-   * Build and submit a MintWrapped instruction on L2.
-   * Called by the deposit processor after confirming an L1 LockTokens event.
+   * Build and submit a ReleaseBridged instruction on L2.
+   * Transfers native MYTH from bridge reserve PDA to recipient.
    *
-   * Account layout (matches process_mint_wrapped in bridge-l2/src/lib.rs):
+   * Account layout (matches process_release_bridged in bridge-l2/src/lib.rs):
    *   0. [signer]          relayer
-   *   1. [signer, writable] payer (= relayer)
-   *   2. []                l2_bridge_config PDA
-   *   3. []                wrapped_token_info PDA
-   *   4. [writable]        l2_mint PDA
-   *   5. [writable]        recipient ATA
-   *   6. [writable]        processed_deposit PDA
-   *   7. []                token_program
-   *   8. []                system_program
+   *   1. [signer, writable] payer (= relayer, pays for processed_deposit PDA rent)
+   *   2. [writable]        l2_bridge_config PDA (updated for accounting)
+   *   3. [writable]        bridge_reserve PDA (native MYTH transferred from here)
+   *   4. [writable]        recipient (receives native MYTH)
+   *   5. [writable]        processed_deposit PDA (created to prevent double-release)
+   *   6. []                system_program
    */
   async mintWrapped(params: {
     l1Mint: PublicKey;
@@ -159,27 +167,17 @@ export class L2Client {
     l1TxSignature: Uint8Array; // 64 bytes
   }): Promise<string> {
     const configPda = this.bridgeConfigPda();
-    const wrappedInfoPda = this.wrappedTokenInfoPda(params.l1Mint);
-    const l2MintPda = this.l2MintPda(params.l1Mint);
+    const reservePda = this.bridgeReservePda();
     const processedPda = this.processedDepositPda(params.depositNonce);
-    const recipientAta = L2Client.getAssociatedTokenAddress(
-      params.recipient,
-      l2MintPda
-    );
 
-    const SPL_TOKEN_PROGRAM = new PublicKey(
-      "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-    );
-
-    // Build instruction data (matches MintWrappedParams in Borsh encoding):
-    //   byte[0]:     discriminator (2)
-    //   bytes[1-8]:  l1_deposit_nonce u64 LE
-    //   bytes[9-40]: recipient Pubkey (32 bytes)
+    // Build instruction data (matches ReleaseBridgedParams in Borsh encoding):
+    //   byte[0]:      discriminator (2 = IX_RELEASE_BRIDGED)
+    //   bytes[1-8]:   l1_deposit_nonce u64 LE
+    //   bytes[9-40]:  recipient Pubkey (32 bytes)
     //   bytes[41-48]: amount u64 LE
-    //   bytes[49-80]: l1_mint Pubkey (32 bytes)
-    //   bytes[81-144]: l1_tx_signature [u8; 64]
-    const data = Buffer.alloc(145);
-    data.writeUInt8(IX_MINT_WRAPPED, 0);
+    //   bytes[49-112]: l1_tx_signature [u8; 64]
+    const data = Buffer.alloc(113); // 1 + 8 + 32 + 8 + 64 = 113
+    data.writeUInt8(IX_RELEASE_BRIDGED, 0);
 
     const nonceBuf = Buffer.alloc(8);
     nonceBuf.writeBigUInt64LE(params.depositNonce);
@@ -191,22 +189,18 @@ export class L2Client {
     amountBuf.writeBigUInt64LE(params.amount);
     amountBuf.copy(data, 41);
 
-    params.l1Mint.toBuffer().copy(data, 49);
-
     const sig64 = Buffer.alloc(64, 0);
     Buffer.from(params.l1TxSignature).copy(sig64, 0);
-    sig64.copy(data, 81);
+    sig64.copy(data, 49);
 
     const accounts: AccountMeta[] = [
-      { pubkey: this.relayer.publicKey, isSigner: true, isWritable: false },  // relayer (signer)
-      { pubkey: this.relayer.publicKey, isSigner: true, isWritable: true },   // payer (signer, writable)
-      { pubkey: configPda, isSigner: false, isWritable: false },               // l2_bridge_config
-      { pubkey: wrappedInfoPda, isSigner: false, isWritable: false },          // wrapped_token_info
-      { pubkey: l2MintPda, isSigner: false, isWritable: true },                // l2_mint
-      { pubkey: recipientAta, isSigner: false, isWritable: true },             // recipient ATA
-      { pubkey: processedPda, isSigner: false, isWritable: true },             // processed_deposit
-      { pubkey: SPL_TOKEN_PROGRAM, isSigner: false, isWritable: false },       // token_program
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // system_program
+      { pubkey: this.relayer.publicKey, isSigner: true, isWritable: false },  // 0. relayer (signer)
+      { pubkey: this.relayer.publicKey, isSigner: true, isWritable: true },   // 1. payer (signer, writable)
+      { pubkey: configPda, isSigner: false, isWritable: true },                // 2. l2_bridge_config (writable for accounting)
+      { pubkey: reservePda, isSigner: false, isWritable: true },               // 3. bridge_reserve PDA (writable)
+      { pubkey: params.recipient, isSigner: false, isWritable: true },         // 4. recipient (writable)
+      { pubkey: processedPda, isSigner: false, isWritable: true },             // 5. processed_deposit PDA (writable)
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // 6. system_program
     ];
 
     const ix = new TransactionInstruction({
@@ -270,26 +264,25 @@ export class L2Client {
 
   /**
    * Parse a BurnWrapped event from L2 bridge log messages.
-   * Matches: "Program log: EVENT:BurnWrapped:{...}"
+   * Matches: "Program log: EVENT:BridgeToL1:{...}"
    */
   static parseBurnEvent(logs: string[]): BurnEvent | null {
     for (const log of logs) {
-      const match = log.match(/^Program log: EVENT:BurnWrapped:(\{.+\})$/);
+      const match = log.match(/^Program log: EVENT:BridgeToL1:(\{.+\})$/);
       if (match) {
         try {
           const parsed = JSON.parse(match[1]) as {
-            burner: string;
+            sender: string;
             l1_recipient: string;
             amount: number;
-            l1_mint: string;
-            burn_nonce: number;
+            withdraw_nonce: number;
           };
           return {
-            burner: parsed.burner,
+            burner: parsed.sender,
             l1Recipient: parsed.l1_recipient, // hex-encoded 32 bytes
             amount: BigInt(parsed.amount),
-            l1Mint: parsed.l1_mint,
-            burnNonce: BigInt(parsed.burn_nonce),
+            l1Mint: "MYTH",
+            burnNonce: BigInt(parsed.withdraw_nonce),
           };
         } catch {
           // malformed JSON — skip

@@ -22,7 +22,7 @@ export class L2Watcher {
     this.running = true;
     logger.info(
       { program: config.L2_BRIDGE_PROGRAM, rpc: config.L2_RPC_URL },
-      "L2Watcher: Starting — watching for burn/withdrawal events"
+      "L2Watcher: Starting — watching for BridgeToL1 withdrawal events"
     );
     await this.poll();
   }
@@ -114,7 +114,7 @@ export class L2Watcher {
               burnNonce: burnEvent.burnNonce.toString(),
               l1Mint: burnEvent.l1Mint,
             },
-            "L2Watcher: BurnWrapped event detected"
+            "L2Watcher: BridgeToL1 event detected"
           );
 
           try {
@@ -134,15 +134,23 @@ export class L2Watcher {
       }
     }
 
-    // ── Part 2: Release mature withdrawals ────────────────────────────────────
-    // Check for any withdrawals whose challenge period has expired and trigger
-    // the L1 release on their behalf.
+    // ── Part 2: Initiate mature withdrawals on L1 ────────────────────────────
     try {
       await this.withdrawProcessor.processMatureWithdrawals();
     } catch (err) {
       logger.error(
         { err },
-        "L2Watcher: Error processing mature withdrawals"
+        "L2Watcher: Error initiating mature withdrawals"
+      );
+    }
+
+    // ── Part 3: Finalize initiated withdrawals on L1 ──────────────────────────
+    try {
+      await this.withdrawProcessor.processInitiatedWithdrawals();
+    } catch (err) {
+      logger.error(
+        { err },
+        "L2Watcher: Error finalizing initiated withdrawals"
       );
     }
   }
