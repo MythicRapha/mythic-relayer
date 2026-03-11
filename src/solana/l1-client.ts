@@ -240,7 +240,7 @@ export class L1Client {
 
     // Token-2022 program and ATA program
   static readonly TOKEN_2022_PROGRAM = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
-  static readonly ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bbd");
+  static readonly ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
   /**
    * Derive the Token-2022 Associated Token Account for a wallet + mint.

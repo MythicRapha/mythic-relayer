@@ -32,7 +32,7 @@ const L2_SWAP_PROGRAM = new PublicKey(
 
 // SPL Token program
 const SPL_TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-const ASSOCIATED_TOKEN_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bbd");
+const ASSOCIATED_TOKEN_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
 // Bridge PDA seeds (matching bridge-l2 program)
 const L2_BRIDGE_CONFIG_SEED = Buffer.from("l2_bridge_config");
