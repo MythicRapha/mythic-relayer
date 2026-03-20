@@ -1,14 +1,30 @@
-Copyright (c) 2026 MythicLabs. All rights reserved.
+Business Source License 1.1
 
-PROPRIETARY AND CONFIDENTIAL
+License text copyright (c) 2017 MariaDB Corporation Ab, All Rights Reserved.
+"Business Source License" is a trademark of MariaDB Corporation Ab.
 
-This software and its source code are the proprietary property of MythicLabs
-and are protected by copyright law and international treaties. Unauthorized
-reproduction, distribution, modification, or use of this software, in whole
-or in part, is strictly prohibited without the prior written consent of
-MythicLabs.
+Parameters
 
-No license, express or implied, is granted to any intellectual property
-rights in this software.
+Licensor:             Mythic Laboratories, Inc.
+Licensed Work:        The Licensed Work is (c) 2026 Mythic Laboratories, Inc.
+Additional Use Grant: You may use the Licensed Work only for non-production,
+                      non-commercial purposes such as testing, development,
+                      and evaluation. Any production or commercial use requires
+                      a separate commercial license from the Licensor.
+Change Date:          February 1, 2028
+Change License:       MIT License
 
-For licensing inquiries: mythiclabs@outlook.com
+For information about alternative licensing arrangements, please contact:
+licensing@mythiclabs.io
+
+Notice
+
+The Business Source License (this document, or the "License") is not an Open
+Source license. However, the Licensed Work will eventually be made available
+under an Open Source License, as stated in this License.
+
+License text: https://mariadb.com/bsl11/
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
